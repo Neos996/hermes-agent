@@ -771,7 +771,7 @@ class GatewayRunner:
             tmp_agent = AIAgent(
                 **runtime_kwargs,
                 model=model,
-                max_iterations=8,
+                max_iterations=4,
                 quiet_mode=True,
                 skip_memory=True,  # Flush agent — no memory provider
                 enabled_toolsets=["memory", "skills"],
@@ -2055,7 +2055,58 @@ class GatewayRunner:
         """
         await asyncio.sleep(60)  # initial delay — let the gateway fully start
         _flush_failures: dict[str, int] = {}  # session_id -> consecutive failure count
+        _flush_inflight: set[str] = set()
         _MAX_FLUSH_RETRIES = 3
+
+        async def _flush_expired_session(key: str, entry) -> None:
+            try:
+                await self._async_flush_memories(entry.session_id, key)
+                # Shut down memory provider and close tool resources
+                # on the cached agent.  Idle agents live in
+                # _agent_cache (not _running_agents), so look there.
+                _cached_agent = None
+                _cache_lock = getattr(self, "_agent_cache_lock", None)
+                if _cache_lock is not None:
+                    with _cache_lock:
+                        _cached = self._agent_cache.get(key)
+                        _cached_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
+                # Fall back to _running_agents in case the agent is
+                # still mid-turn when the expiry fires.
+                if _cached_agent is None:
+                    _cached_agent = self._running_agents.get(key)
+                if _cached_agent and _cached_agent is not _AGENT_PENDING_SENTINEL:
+                    self._cleanup_agent_resources(_cached_agent)
+                # Mark as flushed and persist to disk so the flag
+                # survives gateway restarts.
+                with self.session_store._lock:
+                    entry.memory_flushed = True
+                    self.session_store._save()
+                logger.debug(
+                    "Memory flush completed for session %s",
+                    entry.session_id,
+                )
+                _flush_failures.pop(entry.session_id, None)
+            except Exception as e:
+                failures = _flush_failures.get(entry.session_id, 0) + 1
+                _flush_failures[entry.session_id] = failures
+                if failures >= _MAX_FLUSH_RETRIES:
+                    logger.warning(
+                        "Memory flush gave up after %d attempts for %s: %s. "
+                        "Marking as flushed to prevent infinite retry loop.",
+                        failures, entry.session_id, e,
+                    )
+                    with self.session_store._lock:
+                        entry.memory_flushed = True
+                        self.session_store._save()
+                    _flush_failures.pop(entry.session_id, None)
+                else:
+                    logger.debug(
+                        "Memory flush failed (%d/%d) for %s: %s",
+                        failures, _MAX_FLUSH_RETRIES, entry.session_id, e,
+                    )
+            finally:
+                _flush_inflight.discard(entry.session_id)
+
         while self._running:
             try:
                 self.session_store._ensure_loaded()
@@ -2084,66 +2135,27 @@ class GatewayRunner:
                         len(_expired_entries), _plat_summary,
                     )
 
+                _scheduled = 0
                 for key, entry in _expired_entries:
-                    try:
-                        await self._async_flush_memories(entry.session_id, key)
-                        # Shut down memory provider and close tool resources
-                        # on the cached agent.  Idle agents live in
-                        # _agent_cache (not _running_agents), so look there.
-                        _cached_agent = None
-                        _cache_lock = getattr(self, "_agent_cache_lock", None)
-                        if _cache_lock is not None:
-                            with _cache_lock:
-                                _cached = self._agent_cache.get(key)
-                                _cached_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
-                        # Fall back to _running_agents in case the agent is
-                        # still mid-turn when the expiry fires.
-                        if _cached_agent is None:
-                            _cached_agent = self._running_agents.get(key)
-                        if _cached_agent and _cached_agent is not _AGENT_PENDING_SENTINEL:
-                            self._cleanup_agent_resources(_cached_agent)
-                        # Mark as flushed and persist to disk so the flag
-                        # survives gateway restarts.
-                        with self.session_store._lock:
-                            entry.memory_flushed = True
-                            self.session_store._save()
-                        logger.debug(
-                            "Memory flush completed for session %s",
-                            entry.session_id,
-                        )
-                        _flush_failures.pop(entry.session_id, None)
-                    except Exception as e:
-                        failures = _flush_failures.get(entry.session_id, 0) + 1
-                        _flush_failures[entry.session_id] = failures
-                        if failures >= _MAX_FLUSH_RETRIES:
-                            logger.warning(
-                                "Memory flush gave up after %d attempts for %s: %s. "
-                                "Marking as flushed to prevent infinite retry loop.",
-                                failures, entry.session_id, e,
-                            )
-                            with self.session_store._lock:
-                                entry.memory_flushed = True
-                                self.session_store._save()
-                            _flush_failures.pop(entry.session_id, None)
-                        else:
-                            logger.debug(
-                                "Memory flush failed (%d/%d) for %s: %s",
-                                failures, _MAX_FLUSH_RETRIES, entry.session_id, e,
-                            )
+                    if entry.session_id in _flush_inflight:
+                        continue
+                    _flush_inflight.add(entry.session_id)
+                    _task = asyncio.create_task(_flush_expired_session(key, entry))
+                    self._background_tasks.add(_task)
+                    _task.add_done_callback(self._background_tasks.discard)
+                    _scheduled += 1
 
                 if _expired_entries:
-                    _flushed = sum(
-                        1 for _, e in _expired_entries if e.memory_flushed
-                    )
-                    _failed = len(_expired_entries) - _flushed
-                    if _failed:
+                    if _scheduled:
                         logger.info(
-                            "Session expiry done: %d flushed, %d pending retry",
-                            _flushed, _failed,
+                            "Session expiry scheduled: %d new flush task(s), %d already in progress",
+                            _scheduled,
+                            len(_expired_entries) - _scheduled,
                         )
                     else:
                         logger.info(
-                            "Session expiry done: %d flushed", _flushed,
+                            "Session expiry: %d session(s) already flushing",
+                            len(_expired_entries),
                         )
             except Exception as e:
                 logger.debug("Session expiry watcher error: %s", e)

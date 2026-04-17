@@ -2358,6 +2358,34 @@ class AIAgent:
         "If nothing stands out, just say 'Nothing to save.' and stop."
     )
 
+    def _spawn_background_memory_sync(
+        self,
+        user_content: str,
+        assistant_content: str,
+    ) -> None:
+        """Sync external memory providers after the response without blocking turn completion."""
+        if not self._memory_manager or not user_content or not assistant_content:
+            return
+
+        session_id = self.session_id or ""
+
+        def _run_sync():
+            try:
+                self._memory_manager.sync_all(
+                    user_content,
+                    assistant_content,
+                    session_id=session_id,
+                )
+                self._memory_manager.queue_prefetch_all(
+                    user_content,
+                    session_id=session_id,
+                )
+            except Exception as e:
+                logger.debug("Background memory sync failed: %s", e)
+
+        t = threading.Thread(target=_run_sync, daemon=True, name="bg-memory-sync")
+        t.start()
+
     def _spawn_background_review(
         self,
         messages_snapshot: List[Dict],
@@ -2390,7 +2418,7 @@ class AIAgent:
                      contextlib.redirect_stderr(_devnull):
                     review_agent = AIAgent(
                         model=self.model,
-                        max_iterations=8,
+                        max_iterations=4,
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
@@ -11279,8 +11307,10 @@ class AIAgent:
         # injected skill content that bloats / breaks provider queries.
         if self._memory_manager and final_response and original_user_message:
             try:
-                self._memory_manager.sync_all(original_user_message, final_response)
-                self._memory_manager.queue_prefetch_all(original_user_message)
+                self._spawn_background_memory_sync(
+                    original_user_message,
+                    final_response,
+                )
             except Exception:
                 pass
 
