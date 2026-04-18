@@ -12,6 +12,7 @@ Tests cover:
 - Error handling (invalid JSON, missing fields)
 """
 
+import asyncio
 import json
 import time
 import uuid
@@ -227,6 +228,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     return app
 
 
@@ -238,6 +241,55 @@ def adapter():
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")
+
+
+# ---------------------------------------------------------------------------
+# /v1/runs endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestRunsEndpoint:
+    @pytest.mark.asyncio
+    async def test_run_queue_pusher_attaches_effective_session_id(self, adapter):
+        run_id = "run_test"
+        q: asyncio.Queue = asyncio.Queue()
+        adapter._run_streams[run_id] = q
+        pusher = adapter._make_run_queue_pusher(
+            run_id,
+            asyncio.get_running_loop(),
+            session_id_getter=lambda: "sess-compressed",
+        )
+
+        pusher({
+            "event": "message.delta",
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "delta": "hello",
+        })
+
+        await asyncio.sleep(0)
+        event = await q.get()
+        assert event["event"] == "message.delta"
+        assert event["session_id"] == "sess-compressed"
+
+    @pytest.mark.asyncio
+    async def test_run_event_callback_attaches_effective_session_id(self, adapter):
+        run_id = "run_test"
+        q: asyncio.Queue = asyncio.Queue()
+        adapter._run_streams[run_id] = q
+        callback = adapter._make_run_event_callback(
+            run_id,
+            asyncio.get_running_loop(),
+            session_id_getter=lambda: "sess-compressed",
+        )
+
+        callback("tool.started", "terminal", "pwd", {"command": "pwd"})
+
+        await asyncio.sleep(0)
+        event = await q.get()
+        assert event["event"] == "tool.started"
+        assert event["tool"] == "terminal"
+        assert event["session_id"] == "sess-compressed"
 
 
 # ---------------------------------------------------------------------------

@@ -2038,16 +2038,41 @@ class APIServerAdapter(BasePlatformAdapter):
     _MAX_CONCURRENT_RUNS = 10  # Prevent unbounded resource allocation
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+    def _make_run_queue_pusher(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        session_id_getter=None,
+    ):
+        """Return a thread-safe queue pusher for run SSE events."""
         def _push(event: Dict[str, Any]) -> None:
             q = self._run_streams.get(run_id)
             if q is None:
                 return
+            if session_id_getter is not None:
+                try:
+                    current_session_id = session_id_getter()
+                except Exception:
+                    current_session_id = None
+                if current_session_id:
+                    event["session_id"] = current_session_id
             try:
                 loop.call_soon_threadsafe(q.put_nowait, event)
             except Exception:
                 pass
+
+        return _push
+
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        session_id_getter=None,
+    ):
+        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        _push = self._make_run_queue_pusher(
+            run_id, loop, session_id_getter=session_id_getter,
+        )
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
@@ -2111,21 +2136,29 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = time.time()
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        agent_ref = [None]
+
+        def _current_session_id():
+            agent = agent_ref[0]
+            return getattr(agent, "session_id", session_id) if agent is not None else session_id
+
+        queue_push = self._make_run_queue_pusher(
+            run_id, loop, session_id_getter=_current_session_id,
+        )
+        event_cb = self._make_run_event_callback(
+            run_id, loop, session_id_getter=_current_session_id,
+        )
 
         # Also wire stream_delta_callback so message.delta events flow through
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
                 return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
+            queue_push({
+                "event": "message.delta",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "delta": delta,
+            })
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
@@ -2186,6 +2219,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                 )
+                agent_ref[0] = agent
                 def _run_sync():
                     r = agent.run_conversation(
                         user_message=user_message,
@@ -2222,6 +2256,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                agent_ref[0] = None
                 # Sentinel: signal SSE stream to close
                 try:
                     q.put_nowait(None)
