@@ -402,10 +402,10 @@ class TestPreflightCompression:
         # Set a small context so the history is "oversized", but large enough
         # that the compressed result (2 short messages) fits in a single pass.
         agent.context_compressor.context_length = 2000
-        agent.context_compressor.threshold_tokens = 200
+        agent.context_compressor.threshold_tokens = 300
 
         # Build a history that will be large enough to trigger preflight
-        # (each message ~50 chars ≈ 13 tokens, 40 messages ≈ 520 tokens > 200 threshold)
+        # (each message ~50 chars ≈ 13 tokens, 40 messages ≈ 520 tokens > 300 threshold)
         big_history = []
         for i in range(20):
             big_history.append({"role": "user", "content": f"Message number {i} with some extra text padding"})
@@ -484,6 +484,55 @@ class TestPreflightCompression:
             result = agent.run_conversation("hello", conversation_history=big_history)
 
         mock_compress.assert_not_called()
+
+
+class TestRepeatedCompressionSessionReuse:
+    """Repeated compression before the first transcript flush should reuse
+    the same continuation session instead of spawning empty child chains."""
+
+    def test_reuses_pending_continuation_session(self, agent):
+        session_db = MagicMock()
+        agent._session_db = session_db
+        agent.session_id = "parent_session"
+        agent.session_log_file = agent.logs_dir / "session_parent_session.json"
+        agent._compression_session_pending_flush = False
+        agent._last_flushed_db_idx = 5
+
+        with (
+            patch.object(agent, "flush_memories"),
+            patch.object(agent, "commit_memory_session"),
+            patch.object(agent.context_compressor, "compress") as mock_compress,
+            patch.object(agent, "_build_system_prompt", return_value="compressed prompt"),
+        ):
+            mock_compress.side_effect = [
+                [{"role": "user", "content": "summary 1"}],
+                [{"role": "user", "content": "summary 2"}],
+            ]
+
+            first_messages, _ = agent._compress_context(
+                [{"role": "user", "content": "m1"}] * 10,
+                "system prompt",
+                approx_tokens=120000,
+                task_id="task-1",
+            )
+            first_session_id = agent.session_id
+
+            second_messages, _ = agent._compress_context(
+                first_messages,
+                "system prompt",
+                approx_tokens=110000,
+                task_id="task-1",
+            )
+
+        assert first_session_id != "parent_session"
+        assert agent.session_id == first_session_id
+        assert agent._compression_session_pending_flush is True
+        assert session_db.end_session.call_count == 1
+        assert session_db.create_session.call_count == 1
+        session_db.update_system_prompt.assert_called_with(first_session_id, "compressed prompt")
+
+        agent._flush_messages_to_session_db(second_messages, conversation_history=None)
+        assert agent._compression_session_pending_flush is False
 
 
 class TestToolResultPreflightCompression:

@@ -1163,6 +1163,11 @@ class AIAgent:
         self._session_db = session_db
         self._parent_session_id = parent_session_id
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
+        # True after a compression continuation session is created and before
+        # its first transcript flush. Repeated compressions in that window
+        # should reuse the same continuation session instead of spawning
+        # empty child sessions.
+        self._compression_session_pending_flush = False
         if self._session_db:
             try:
                 self._session_db.create_session(
@@ -2563,6 +2568,8 @@ class AIAgent:
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                 )
             self._last_flushed_db_idx = len(messages)
+            if len(messages) > flush_from:
+                self._compression_session_pending_flush = False
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
 
@@ -7217,28 +7224,38 @@ class AIAgent:
 
         if self._session_db:
             try:
-                # Propagate title to the new session with auto-numbering
-                old_title = self._session_db.get_session_title(self.session_id)
-                # Trigger memory extraction on the old session before it rotates.
-                self.commit_memory_session(messages)
-                self._session_db.end_session(self.session_id, "compression")
-                old_session_id = self.session_id
-                self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-                # Update session_log_file to point to the new session's JSON file
-                self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
-                self._session_db.create_session(
-                    session_id=self.session_id,
-                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                    model=self.model,
-                    parent_session_id=old_session_id,
-                )
-                # Auto-number the title for the continuation session
-                if old_title:
-                    try:
-                        new_title = self._session_db.get_next_title_in_lineage(old_title)
-                        self._session_db.set_session_title(self.session_id, new_title)
-                    except (ValueError, Exception) as e:
-                        logger.debug("Could not propagate title on compression: %s", e)
+                if self._compression_session_pending_flush:
+                    # A continuation session already exists for this turn but
+                    # hasn't received any transcript rows yet. Reuse it rather
+                    # than creating another empty child session.
+                    logger.info(
+                        "Reusing pending compression continuation session %s",
+                        self.session_id,
+                    )
+                else:
+                    # Propagate title to the new session with auto-numbering
+                    old_title = self._session_db.get_session_title(self.session_id)
+                    # Trigger memory extraction on the old session before it rotates.
+                    self.commit_memory_session(messages)
+                    self._session_db.end_session(self.session_id, "compression")
+                    old_session_id = self.session_id
+                    self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                    # Update session_log_file to point to the new session's JSON file
+                    self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
+                    self._session_db.create_session(
+                        session_id=self.session_id,
+                        source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                        model=self.model,
+                        parent_session_id=old_session_id,
+                    )
+                    # Auto-number the title for the continuation session
+                    if old_title:
+                        try:
+                            new_title = self._session_db.get_next_title_in_lineage(old_title)
+                            self._session_db.set_session_title(self.session_id, new_title)
+                        except (ValueError, Exception) as e:
+                            logger.debug("Could not propagate title on compression: %s", e)
+                    self._compression_session_pending_flush = True
                 self._session_db.update_system_prompt(self.session_id, new_system_prompt)
                 # Reset flush cursor — new session starts with no messages written
                 self._last_flushed_db_idx = 0
