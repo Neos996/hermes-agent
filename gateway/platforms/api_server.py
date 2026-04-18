@@ -2178,6 +2178,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt = instructions
 
         async def _run_and_close():
+            agent = None
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -2206,6 +2207,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": time.time(),
                     "output": final_response,
                     "usage": usage,
+                    "session_id": getattr(agent, "session_id", session_id),
                 })
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
@@ -2215,6 +2217,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "error": str(exc),
+                        "session_id": getattr(agent, "session_id", session_id),
                     })
                 except Exception:
                     pass
@@ -2233,7 +2236,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-        return web.json_response({"run_id": run_id, "status": "started"}, status=202)
+        return web.json_response(
+            {"run_id": run_id, "status": "started", "session_id": session_id},
+            status=202,
+        )
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
